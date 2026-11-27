@@ -1,4 +1,4 @@
-// AstraCYD v0.2.2 — read-only OBD-II dashboard for ESP32-2432S028R.
+// AstraCYD v0.2.3 — read-only OBD-II dashboard for ESP32-2432S028R.
 // Target: classic ESP32-WROOM-32, 2.8" ILI9341 + XPT2046 CYD.
 // IMPORTANT: This is a first hardware prototype; confirm your CYD revision.
 // All commands below are OBD-II READ commands. No ECU coding/flashing.
@@ -8,6 +8,7 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <BluetoothSerial.h>
+#include <esp_gap_bt_api.h>
 #include <Preferences.h>
 #include <math.h>
 #include <atomic>
@@ -26,7 +27,6 @@ static constexpr int TP_SCK = 25;
 static constexpr int TP_MISO = 39;
 static constexpr int TP_MOSI = 32;
 
-static constexpr char ELM_NAME[] = "OBDII";
 
 // XPT2046 raw calibration varies; these are INITIAL estimates only.
 // For a mirrored touch, change the corresponding MIN/MAX order.
@@ -50,7 +50,7 @@ constexpr uint16_t GREY  = 0xA514;
 constexpr uint16_t GREEN = 0x37E6;
 constexpr uint16_t RED   = 0xF800;
 
-enum Page : uint8_t { HOME, ENGINE, TRIP, SETTINGS };
+enum Page : uint8_t { HOME, ENGINE, TRIP, SETTINGS, ADAPTERS };
 Page page = HOME;
 
 struct Telemetry {
@@ -68,6 +68,23 @@ bool wasConnected = false;
 bool touchHeld = false;
 bool reconnectRequested = false;
 std::atomic<bool> connecting{false};
+std::atomic<bool> scanDone{false};
+QueueHandle_t scanQueue = nullptr;
+bool scanRequested = false;
+bool scanOk = false;
+bool btReady = false;
+bool hasAdapter = false;
+uint8_t adapterAddress[6]{};
+String adapterName;
+constexpr int SCAN_LIMIT = 32;
+constexpr int SCAN_ROWS = 4;
+struct ScanDevice {
+  uint8_t address[6];
+  char name[33];
+};
+ScanDevice devices[SCAN_LIMIT];
+int deviceCount = 0;
+int deviceOffset = 0;
 uint32_t ecuAt = 0;
 uint32_t nextBtAttempt = 0;
 uint32_t lastDraw = 0;
@@ -132,7 +149,7 @@ ShiftAdvice getAdvice(int gear) {
   return NO_ADVICE;
 }
 
-enum Field { BT_STATUS, PRIMARY, SECONDARY, THIRD, FOURTH, TEMPERATURE, ENGINE_LOAD, VOLTAGE, FIELD_COUNT };
+enum Field { BT_STATUS, PRIMARY, SECONDARY, THIRD, FOURTH, TEMPERATURE, ENGINE_LOAD, VOLTAGE, SCAN_ADDR_1, SCAN_ADDR_2, SCAN_ADDR_3, SCAN_ADDR_4, FIELD_COUNT };
 
 struct DisplayField {
   String value;
@@ -169,7 +186,7 @@ void drawTabs() {
   tft.fillRect(0, 209, 320, 31, PANEL);
   for (int i = 0; i < 4; ++i) {
     int x = i * 80;
-    const bool active = page == static_cast<Page>(i);
+    const bool active = (page == ADAPTERS ? SETTINGS : page) == static_cast<Page>(i);
     if (active) tft.fillRoundRect(x + 2, 211, 76, 27, 4, LINE);
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(active ? AMBER : WHITE, active ? LINE : PANEL);
@@ -241,13 +258,51 @@ void drawTrip(bool newPage) {
 }
 
 void drawSettings(bool newPage) {
-  labelValue(PRIMARY, 38, "ADAPTER", ELM_NAME, newPage);
+  labelValue(PRIMARY, 38, "SCAN BT (TAP)", "OPEN", newPage);
   labelValue(SECONDARY, 73, "BT PIN (TAP)", pin0000 ? "0000" : "1234", newPage);
   labelValue(THIRD, 108, "RECONNECT (TAP)", "NOW", newPage);
-  labelValue(FOURTH, 143, "DISPLAY", "CYD 2.8 R", newPage);
+  labelValue(FOURTH, 143, "ADAPTER", hasAdapter ? adapterName : "NONE", newPage);
   if (newPage) putText(16, 182, "Touch tab bar to change page", 2, GREY);
 }
 
+String shortName(String name, unsigned limit) {
+  for (unsigned i = 0; i < name.length(); ++i) {
+    if (static_cast<uint8_t>(name[i]) < 32 || static_cast<uint8_t>(name[i]) > 126) name.setCharAt(i, '?');
+  }
+  return name.length() > limit ? name.substring(0, limit - 3) + "..." : name;
+}
+
+void drawAdapters(bool newPage) {
+  const bool scanning = scanRequested || connecting.load();
+  const char *caption = scanning ? "Scanning Bluetooth Classic..." :
+      (!scanOk ? "Scan failed" : (deviceCount ? "Tap your adapter" : "No devices found"));
+  updateText(TEMPERATURE, 12, 31, caption, 2, WHITE, TL_DATUM, 296);
+  const Field rows[] = {PRIMARY, SECONDARY, THIRD, FOURTH};
+  for (int row = 0; row < SCAN_ROWS; ++row) {
+    const int y = 51 + row * 29;
+    const int index = deviceOffset + row;
+    if (newPage) tft.fillRect(9, y, 302, 27, PANEL);
+    String label = " ";
+    String address = " ";
+    if (!scanning && index < deviceCount) {
+      const ScanDevice &entry = devices[index];
+      label = entry.name[0] ? shortName(entry.name, 20) : String("(unnamed)");
+      char text[18];
+      snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X",
+               entry.address[0], entry.address[1], entry.address[2],
+               entry.address[3], entry.address[4], entry.address[5]);
+      address = text;
+    }
+    updateText(rows[row], 16, y + 5, label, 2, AMBER, TL_DATUM, 177, PANEL);
+    updateText(static_cast<Field>(SCAN_ADDR_1 + row), 304, y + 5, address, 2, WHITE, TR_DATUM, 105, PANEL);
+  }
+  if (newPage) {
+    putText(12, 180, "PREV", 2, WHITE);
+    putText(105, 180, "RESCAN", 2, WHITE);
+    putText(200, 180, "NEXT", 2, WHITE);
+    putText(312, 180, "BACK", 2, WHITE, TR_DATUM);
+  }
+}
 void redraw() {
   if (drawnPage < 0) {
     tft.fillRect(0, 0, SCREEN_W, 28, PANEL);
@@ -271,8 +326,28 @@ void redraw() {
     case ENGINE: drawEngine(newPage); break;
     case TRIP: drawTrip(newPage); break;
     case SETTINGS: drawSettings(newPage); break;
+    case ADAPTERS: drawAdapters(newPage); break;
   }
 }
+void requestScan() {
+  deviceOffset = 0;
+  scanRequested = true;
+  page = ADAPTERS;
+}
+
+void selectAdapter(const ScanDevice &device) {
+  if (prefs.putBytes("elmAddr", device.address, sizeof(adapterAddress)) != sizeof(adapterAddress)) {
+    Serial.println("Could not save adapter address");
+    return;
+  }
+  adapterName = shortName(device.name[0] ? device.name : "Unnamed", 12);
+  prefs.putString("elmName", adapterName);
+  memcpy(adapterAddress, device.address, sizeof(adapterAddress));
+  hasAdapter = true;
+  reconnectRequested = true;
+  page = SETTINGS;
+}
+
 void handleTouch() {
   if (!touch.tirqTouched() || !touch.touched()) {
     touchHeld = false;
@@ -289,7 +364,23 @@ void handleTouch() {
   lastTouch = millis();
   if (y >= 207) {
     page = (Page)constrain(x / 80, 0, 3);
+  } else if (page == ADAPTERS) {
+    if (y >= 175 && y < 207 && x >= 262) {
+      page = SETTINGS;
+    } else if (!scanRequested && !connecting.load()) {
+      if (y >= 51 && y < 167) {
+        const int index = deviceOffset + (y - 51) / 29;
+        if (index < deviceCount) selectAdapter(devices[index]);
+      } else if (y >= 175 && y < 207) {
+        if (x < 83 && deviceOffset > 0) deviceOffset -= SCAN_ROWS;
+        else if (x >= 83 && x < 172) requestScan();
+        else if (x >= 172 && x < 262 && deviceOffset + SCAN_ROWS < deviceCount) deviceOffset += SCAN_ROWS;
+      }
+    }
   } else if (page == SETTINGS && x > 8 && x < 312) {
+    if (y >= 38 && y < 68) {
+      requestScan();
+    }
     if (y >= 73 && y <= 104) {
       pin0000 = !pin0000;
       prefs.putBool("pin0000", pin0000);
@@ -369,7 +460,7 @@ void sendELM(const char* cmd) {
 }
 
 void connectAdapter(void*) {
-  elm.connect(String(ELM_NAME));
+  elm.connect(adapterAddress);
   nextBtAttempt = millis() + 8000;
   connecting.store(false);
   vTaskDelete(nullptr);
@@ -383,8 +474,91 @@ void restartAdapter() {
   nextBtAttempt = millis() + 1000;
 }
 
+void scanCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *params) {
+  if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT &&
+      params->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+    scanDone.store(true);
+  }
+  if (event != ESP_BT_GAP_DISC_RES_EVT) return;
+
+  ScanDevice entry{};
+  memcpy(entry.address, params->disc_res.bda, sizeof(entry.address));
+  for (int i = 0; i < params->disc_res.num_prop; ++i) {
+    const auto &property = params->disc_res.prop[i];
+    const uint8_t *name = nullptr;
+    int length = 0;
+    if (property.type == ESP_BT_GAP_DEV_PROP_BDNAME) {
+      name = static_cast<const uint8_t*>(property.val);
+      length = property.len;
+    } else if (property.type == ESP_BT_GAP_DEV_PROP_EIR && !entry.name[0]) {
+      auto *eir = static_cast<uint8_t*>(property.val);
+      uint8_t size = 0;
+      name = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &size);
+      if (!name) name = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &size);
+      length = size;
+    }
+    if (name && length > 0) {
+      const int copied = min(length, static_cast<int>(sizeof(entry.name)) - 1);
+      memcpy(entry.name, name, copied);
+      entry.name[copied] = '\0';
+    }
+  }
+  xQueueSend(scanQueue, &entry, 0);
+}
+
+void scanAdapters(void*) {
+  if (elm.connected()) elm.disconnect();
+  xQueueReset(scanQueue);
+  deviceCount = 0;
+  scanDone.store(false);
+  // BluetoothSerial discovery refuses scans after an address has been selected.
+  // Use a temporary GAP callback and restore the SPP stack before reconnecting.
+  const bool registered = esp_bt_gap_register_callback(scanCallback) == ESP_OK;
+  scanOk = registered && esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 5, 0) == ESP_OK;
+  if (scanOk) {
+    const uint32_t start = millis();
+    while (millis() - start < 14000) {
+      ScanDevice entry;
+      if (xQueueReceive(scanQueue, &entry, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int index = 0;
+        while (index < deviceCount && memcmp(devices[index].address, entry.address, sizeof(entry.address))) ++index;
+        if (index < deviceCount && entry.name[0]) devices[index] = entry;
+        else if (index == deviceCount && deviceCount < SCAN_LIMIT) devices[deviceCount++] = entry;
+      } else if (scanDone.load()) {
+        break;
+      }
+    }
+    if (!scanDone.load()) esp_bt_gap_cancel_discovery();
+  }
+  if (registered) {
+    elm.end();
+    btReady = elm.begin("AstraCYD", true);
+  }
+  connecting.store(false);
+  vTaskDelete(nullptr);
+}
 void pollOBD() {
-  if (connecting.load() || btState == "BT ERROR") return;
+  if (connecting.load()) return;
+  if (scanRequested) {
+    scanRequested = false;
+    resetTelemetry();
+    wasConnected = false;
+    btState = "BT SCANNING";
+    scanOk = false;
+    deviceCount = 0;
+    if (btReady && scanQueue) {
+      connecting.store(true);
+      if (xTaskCreate(scanAdapters, "ELM scan", 4096, nullptr, 1, nullptr) != pdPASS) {
+        connecting.store(false);
+      }
+    }
+    return;
+  }
+  if (btState == "BT SCANNING") {
+    btState = btReady ? "SELECT ADAPTER" : "BT ERROR";
+    nextBtAttempt = millis();
+  }
+  if (!btReady || page == ADAPTERS) return;
   if (reconnectRequested) {
     reconnectRequested = false;
     restartAdapter();
@@ -394,6 +568,10 @@ void pollOBD() {
     if (wasConnected) {
       restartAdapter();
       btState = "BT LOST";
+    }
+    if (!hasAdapter) {
+      btState = "SELECT ADAPTER";
+      return;
     }
     if (btState == "BT CONNECT...") btState = "BT RETRY";
     if (static_cast<int32_t>(millis() - nextBtAttempt) >= 0) {
@@ -459,12 +637,16 @@ void setup() {
   touch.setRotation(1);
   prefs.begin("astracyd", false);
   pin0000 = prefs.getBool("pin0000", false);
-  const bool btReady = elm.begin("AstraCYD", true);
+  hasAdapter = prefs.getBytesLength("elmAddr") == sizeof(adapterAddress) &&
+      prefs.getBytes("elmAddr", adapterAddress, sizeof(adapterAddress)) == sizeof(adapterAddress);
+  adapterName = prefs.getString("elmName", "Saved");
+  scanQueue = xQueueCreate(20, sizeof(ScanDevice));
+  btReady = elm.begin("AstraCYD", true);
   sessionStart = millis();
   btState = btReady ? "BT START" : "BT ERROR";
   nextBtAttempt = millis() + 1000;
   redraw();
-  Serial.println("AstraCYD v0.2.2 ready; ELM queries are READ-ONLY");
+  Serial.println("AstraCYD v0.2.3 ready; ELM queries are READ-ONLY");
 }
 
 void loop() {
@@ -476,11 +658,3 @@ void loop() {
   }
   delay(5);
 }
-
-
-
-
-
-
-
-
